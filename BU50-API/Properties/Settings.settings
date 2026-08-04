@@ -1,0 +1,45 @@
+<?xml version='1.0' encoding='utf-8'?>
+<SettingsFile xmlns="http://schemas.microsoft.com/VisualStudio/2004/01/settings" CurrentProfile="(Default)" GeneratedClassNamespace="BU50_API.Properties" GeneratedClassName="Settings">
+  <Profiles />
+  <Settings>
+    <Setting Name="ServerName" Type="System.String" Scope="User">
+      <Value Profile="(Default)">192.168.1.9</Value>
+    </Setting>
+    <Setting Name="DataBase" Type="System.String" Scope="User">
+      <Value Profile="(Default)">Focus507D</Value>
+    </Setting>
+    <Setting Name="DB" Type="System.String" Scope="User">
+      <Value Profile="(Default)">TrakingOrdersDB</Value>
+    </Setting>
+    <Setting Name="UserId" Type="System.String" Scope="User">
+      <Value Profile="(Default)">sa</Value>
+    </Setting>
+    <Setting Name="Password" Type="System.String" Scope="User">
+      <Value Profile="(Default)">B@ssw0rd</Value>
+    </Setting>
+    <Setting Name="pagenumbering" Type="System.Int32" Scope="User">
+      <Value Profile="(Default)">0</Value>
+    </Setting>
+    <Setting Name="CompCode" Type="System.String" Scope="User">
+      <Value Profile="(Default)">07D</Value>
+    </Setting>
+    <Setting Name="password2" Type="System.String" Scope="User">
+      <Value Profile="(Default)">34020096@E50e</Value>
+    </Setting>
+    <Setting Name="ServerNameExternal" Type="System.String" Scope="User">
+      <Value Profile="(Default)">198.12.252.164</Value>
+    </Setting>
+    <Setting Name="WebsiteUrl" Type="System.String" Scope="User">
+      <Value Profile="(Default)">https://efifty.com</Value>
+    </Setting>
+    <Setting Name="ExcludedCategoryIds" Type="System.String" Scope="User">
+      <Value Profile="(Default)" />
+    </Setting>
+    <Setting Name="ExcludedCategories" Type="System.String" Scope="User">
+      <Value Profile="(Default)" />
+    </Setting>
+    <Setting Name="ApiKey" Type="System.String" Scope="User">
+      <Value Profile="(Default)">nsk_tZ7KlwbN4e4H7x1py-fn6ASG8dpM9hWNY9oWlavll3g</Value>
+    </Setting>
+  </Settings>
+</SettingsFile>
