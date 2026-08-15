@@ -30,7 +30,7 @@
       <Value Profile="(Default)">198.12.252.164</Value>
     </Setting>
     <Setting Name="WebsiteUrl" Type="System.String" Scope="User">
-      <Value Profile="(Default)">https://efifty.com</Value>
+      <Value Profile="(Default)">https://api.efifty.com</Value>
     </Setting>
     <Setting Name="ExcludedCategoryIds" Type="System.String" Scope="User">
       <Value Profile="(Default)" />

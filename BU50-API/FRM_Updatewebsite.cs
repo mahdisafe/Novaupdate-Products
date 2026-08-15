@@ -72,10 +72,56 @@ namespace BU50_API
         private CancellationTokenSource _fullUpdateCts;
         private bool _autoUpdateStarted;
 
+        /// <summary>
+        /// Admin product sync endpoints live on NovaShop.Api (api.efifty.com), not the storefront.
+        /// www/efifty.com returns Cloudflare 502 for /api/admin/products/*.
+        /// </summary>
+        private static string ResolveNovaShopApiBaseUrl()
+        {
+            var baseUrl = (Settings.Default.WebsiteUrl ?? string.Empty).Trim();
+            if (string.IsNullOrWhiteSpace(baseUrl))
+                baseUrl = "https://api.efifty.com";
+
+            if (!baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                baseUrl = "https://" + baseUrl;
+            }
+
+            baseUrl = baseUrl.TrimEnd('/');
+
+            Uri uri;
+            if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out uri))
+                return "https://api.efifty.com";
+
+            var host = uri.Host ?? string.Empty;
+            if (host.Equals("efifty.com", StringComparison.OrdinalIgnoreCase) ||
+                host.Equals("www.efifty.com", StringComparison.OrdinalIgnoreCase) ||
+                host.Equals("api.www.efifty.com", StringComparison.OrdinalIgnoreCase))
+            {
+                return "https://api.efifty.com";
+            }
+
+            if (host.Equals("api.efifty.com", StringComparison.OrdinalIgnoreCase) &&
+                baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+            {
+                return "https://api.efifty.com";
+            }
+
+            return baseUrl;
+        }
+
         public FRM_Updatewebsite()
         {
             InitializeComponent();
 
+            // Migrate saved storefront URL → API host (one-time persist).
+            var resolvedApi = ResolveNovaShopApiBaseUrl();
+            if (!string.Equals(Settings.Default.WebsiteUrl?.TrimEnd('/'), resolvedApi, StringComparison.OrdinalIgnoreCase))
+            {
+                Settings.Default.WebsiteUrl = resolvedApi;
+                Settings.Default.Save();
+            }
 
             if (Settings.Default.CompCode == "")
             {
@@ -168,26 +214,11 @@ namespace BU50_API
 
             try
             {
-                var baseUrl = BU50_API.Properties.Settings.Default.WebsiteUrl;
-                if (!baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    baseUrl = "http://" + baseUrl;
-                }
-                baseUrl = baseUrl.TrimEnd('/');
-                if (baseUrl.Contains("efifty.com"))
-                {
-                    if (!baseUrl.Contains("www.efifty.com"))
-                    {
-                        baseUrl = baseUrl.Replace("efifty.com", "www.efifty.com");
-                    }
-                    if (baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
-                    {
-                        baseUrl = "https://" + baseUrl.Substring(7);
-                    }
-                }
+                var baseUrl = ResolveNovaShopApiBaseUrl();
 
                 using (var client = new HttpClient())
                 {
+                    client.Timeout = TimeSpan.FromMinutes(5);
                     client.DefaultRequestHeaders.Add("X-Api-Key", Settings.Default.ApiKey);
 
                     var jsonPayload = JsonConvert.SerializeObject(batchCopy);
@@ -219,26 +250,11 @@ namespace BU50_API
                 progressBar1.Style = ProgressBarStyle.Marquee;
 
                 var skuFilter = (txtsku?.Text ?? string.Empty).Trim();
-                var baseUrl = BU50_API.Properties.Settings.Default.WebsiteUrl;
-                if (!baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !baseUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
-                {
-                    baseUrl = "http://" + baseUrl;
-                }
-                baseUrl = baseUrl.TrimEnd('/');
-                if (baseUrl.Contains("efifty.com"))
-                {
-                    if (!baseUrl.Contains("www.efifty.com"))
-                    {
-                        baseUrl = baseUrl.Replace("efifty.com", "www.efifty.com");
-                    }
-                    if (baseUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
-                    {
-                        baseUrl = "https://" + baseUrl.Substring(7);
-                    }
-                }
+                var baseUrl = ResolveNovaShopApiBaseUrl();
 
                 using (var client = new HttpClient())
                 {
+                    client.Timeout = TimeSpan.FromMinutes(5);
                     client.DefaultRequestHeaders.Add("X-Api-Key", Settings.Default.ApiKey);
 
                     var response = await client.GetAsync($"{baseUrl}/api/admin/products/sync-list", cancellationToken);

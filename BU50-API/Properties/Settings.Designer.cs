@@ -133,7 +133,7 @@ namespace BU50_API.Properties {
         
         [global::System.Configuration.UserScopedSettingAttribute()]
         [global::System.Diagnostics.DebuggerNonUserCodeAttribute()]
-        [global::System.Configuration.DefaultSettingValueAttribute("https://efifty.com")]
+        [global::System.Configuration.DefaultSettingValueAttribute("https://api.efifty.com")]
         public string WebsiteUrl {
             get {
                 return ((string)(this["WebsiteUrl"]));
