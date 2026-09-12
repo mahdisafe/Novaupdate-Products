@@ -57,7 +57,8 @@ namespace BU50_API
         // Accumulator for batch updates
         private readonly List<ProductSyncUpdateDto> _pendingBatch = new List<ProductSyncUpdateDto>();
         private readonly List<string> _batchFailureLog = new List<string>();
-        private readonly int _batchSize = ReadIntConfig("BatchSize", 100);
+        private readonly int _batchSize = ReadIntConfig("BatchSize", 250);
+        private readonly int _uiRefreshEvery = Math.Max(5, ReadIntConfig("UiRefreshEvery", 25));
 
         private static int ReadIntConfig(string key, int defaultValue)
         {
@@ -424,6 +425,86 @@ namespace BU50_API
             public string BarcodeYH { get; set; }
         }
 
+        // Latest Focus sell price (srate c=1, pty=0, Vals0) — avoids per-item FRateMaster COM
+        private Dictionary<int, double> LoadFocusSellPriceMap(SqlConnection sql, IEnumerable<int> masterIds)
+        {
+            var result = new Dictionary<int, double>();
+            var ids = masterIds?.Distinct().ToList() ?? new List<int>();
+            if (ids.Count == 0 || sql == null) return result;
+
+            const int chunk = 400;
+            for (int i = 0; i < ids.Count; i += chunk)
+            {
+                var slice = ids.Skip(i).Take(chunk).ToList();
+                var inList = string.Join(",", slice);
+                var query = $@"
+SELECT s.prod, s.Vals0
+FROM srate s
+INNER JOIN (
+    SELECT prod, MAX(Date_) AS MaxDate
+    FROM srate
+    WHERE c = 1 AND pty = 0 AND prod IN ({inList})
+    GROUP BY prod
+) t ON s.prod = t.prod AND s.Date_ = t.MaxDate
+WHERE s.c = 1 AND s.pty = 0";
+
+                using (var cmd = new SqlCommand(query, sql))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        if (reader.IsDBNull(1)) continue;
+                        var prod = Convert.ToInt32(reader.GetValue(0));
+                        var rate = Convert.ToDouble(reader.GetValue(1));
+                        if (rate > 0) result[prod] = rate;
+                    }
+                }
+            }
+            return result;
+        }
+
+        // Active Focus schemes ending with ON — one SQL round-trip instead of per product
+        private Dictionary<int, Tuple<decimal, string>> LoadFocusSchemeMap(SqlConnection sql, IEnumerable<int> masterIds)
+        {
+            var result = new Dictionary<int, Tuple<decimal, string>>();
+            var ids = masterIds?.Distinct().ToList() ?? new List<int>();
+            if (ids.Count == 0 || sql == null) return result;
+
+            var currentDate = GetFocusDate(DateTime.Now);
+            const int chunk = 400;
+            for (int i = 0; i < ids.Count; i += chunk)
+            {
+                var slice = ids.Skip(i).Take(chunk).ToList();
+                var inList = string.Join(",", slice);
+                var query = $@"
+SELECT SchemeBody.Product, SchemeBody.Rate, SchemeHeader.SchemeName, SchemeBody.BodyId
+FROM SchemeHeader
+INNER JOIN SchemeBody ON SchemeHeader.Id = SchemeBody.Id
+WHERE SchemeBody.Product IN ({inList})
+  AND @CurrentDate BETWEEN StDate AND EndDate
+  AND RTRIM(SchemeHeader.SchemeName) LIKE '% ON'
+ORDER BY SchemeBody.BodyId DESC";
+
+                using (var cmd = new SqlCommand(query, sql))
+                {
+                    cmd.Parameters.AddWithValue("@CurrentDate", currentDate);
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            var prod = Convert.ToInt32(reader.GetValue(0));
+                            if (result.ContainsKey(prod)) continue; // first row = highest BodyId
+                            var rate = Convert.ToDecimal(reader.GetValue(1));
+                            var name = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                            if (rate > 0 && name.Trim().EndsWith("ON", StringComparison.OrdinalIgnoreCase))
+                                result[prod] = Tuple.Create(rate, name);
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
         // Prefetch Focus mapping for a list of MasterIds in chunks to reduce per-item SQL calls
         private Dictionary<int, FocusProductInfo> LoadFocusProductInfoMap(SqlConnection sql, IEnumerable<int> masterIds)
         {
@@ -637,11 +718,20 @@ namespace BU50_API
                             .ToList();
                         var focusByBarcodeMap = LoadFocusProductInfoByBarcodeMap(con, emptySknSkus);
 
+                        // Prefetch sell prices + active schemes (SQL) — major speedup vs per-item COM/SQL
+                        var allMasterIds = focusMap.Keys
+                            .Concat(focusByBarcodeMap.Values.Select(v => v.MasterId))
+                            .Distinct()
+                            .ToList();
+                        var priceMap = LoadFocusSellPriceMap(con, allMasterIds);
+                        var schemeMap = LoadFocusSchemeMap(con, allMasterIds);
+                        lblStatus.Text = $"تم تجهيز الأسعار/العروض ({priceMap.Count} سعر، {schemeMap.Count} عرض). جاري التحديث...";
+
                         for (var i = 0; i < products.Count; i++)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
                             // Keep the UI responsive so txtsku accepts keyboard input during long syncs.
-                            if (i % 3 == 0) await Task.Yield();
+                            if (i % 10 == 0) await Task.Yield();
 
                             var product = products[i];
 
@@ -653,7 +743,7 @@ namespace BU50_API
                             }
 
                             // Throttle UI highlight to reduce overhead; never steal focus while user types in txtsku
-                            if (i % 5 == 0 && !ShouldSkipGridUiUpdates())
+                            if (i % _uiRefreshEvery == 0 && !ShouldSkipGridUiUpdates())
                             {
                                 try
                                 {
@@ -708,35 +798,58 @@ namespace BU50_API
                             // Respect Woo manage_stock early
                             bool trackStock = product.manage_stock;
 
-                            // Price from FRateMaster (reuse COM object to avoid per-item construction overhead)
-                            var r = frs.Open(1, 0, masterId, DateTime.Now);
-                            if (r == null)
+                            // Price: prefer prefetched SQL sell rate; COM fallback only if missing
+                            double saleingprice = 0;
+                            if (!priceMap.TryGetValue(masterId, out saleingprice) || saleingprice <= 0)
                             {
-                                await UpdateProductChangeStatus(product.id);
-                                continue;
+                                try
+                                {
+                                    var r = frs.Open(1, 0, masterId, DateTime.Now);
+                                    if (r != null)
+                                    {
+                                        saleingprice = frs.GetRate(0);
+                                        frs.Close();
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"FRateMaster fallback failed for {masterId}: {ex.Message}");
+                                }
                             }
-                            var saleingprice = frs.GetRate(0); // base price
-                            frs.Close();
+
                             if (saleingprice <= 0)
                             {
                                 zeroPriceProducts.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name}");
+                                // Keep going: still update stock / clear sale if needed; draft via Status when price<=0
                             }
 
                             double pQty = 0; double avgVal = 0;
                             List<string> warehouses = null;
                             if (trackStock)
                             {
-                                warehouses = ProcessStockFast(masterId, info.Name, info.BarcodeYH, product.id, ref pQty, ref avgVal);
+                                try
+                                {
+                                    warehouses = ProcessStockFast(masterId, info.Name, info.BarcodeYH, product.id, ref pQty, ref avgVal);
+                                }
+                                catch (Exception ex)
+                                {
+                                    Console.WriteLine($"Stock failed for {masterId}: {ex.Message}");
+                                    pQty = product.stock_quantity ?? 0; // keep current qty on COM error
+                                }
                             }
 
                             // Prepare values for site and compare with current
                             var vat = 1.15;
                             var regularWithVat = saleingprice * vat;
-                            var scheme = GetSchemeDetails(con, product._custom_skn);
+
+                            Tuple<decimal, string> scheme;
+                            if (!schemeMap.TryGetValue(masterId, out scheme) || scheme == null)
+                                scheme = Tuple.Create(0m, "K/n");
+
                             var schemeRateWithVat = scheme.Item1 * (decimal)vat;
                             if (scheme.Item1 <= 0)
                             {
-                                schemeDiagnostics.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name} | reason={scheme.Item2}");
+                                // skip noisy per-item logs when prefetched map already covers actives
                             }
                             else if (regularWithVat > 0 && (double)schemeRateWithVat >= regularWithVat - 0.1)
                             {
@@ -770,8 +883,10 @@ namespace BU50_API
                                 await SendBatchUpdatesAsync();
                             }
 
-                            progressBar2.Value = i + 1;
-                            if (i % 5 == 0 && !ShouldSkipGridUiUpdates())
+                            if (i % _uiRefreshEvery == 0)
+                                progressBar2.Value = Math.Min(progressBar2.Maximum, i + 1);
+
+                            if (i % _uiRefreshEvery == 0 && !ShouldSkipGridUiUpdates())
                             {
                                 try
                                 {
@@ -785,6 +900,8 @@ namespace BU50_API
                                 catch { }
                             }
                         }
+
+                        progressBar2.Value = progressBar2.Maximum;
                         }
                     }
 
