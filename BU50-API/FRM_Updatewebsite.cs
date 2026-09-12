@@ -174,7 +174,8 @@ namespace BU50_API
 
  
         //Add a prepared update object to the batch (deduped by Woo product id within pending batch)
-        private void AddUpdateToBatch(string productIdStr, double wqty, double saleingprice, decimal schemeRateWithVat, string skn, bool trackStock)
+        // When trackStock is false: prices only — preserve existing stock fields (do not zero them).
+        private void AddUpdateToBatch(string productIdStr, double wqty, double saleingprice, decimal schemeRateWithVat, string skn, bool trackStock, int? currentStockQty = null)
         {
             if (!int.TryParse(productIdStr, out var productId))
             {
@@ -188,7 +189,10 @@ namespace BU50_API
                 Barcode = skn ?? string.Empty,
                 Price = saleingprice > 0 ? (decimal)saleingprice : 0m,
                 DiscountPrice = schemeRateWithVat > 0 ? (decimal?)schemeRateWithVat : null,
-                StockQuantity = trackStock ? Convert.ToInt32(Math.Round(wqty)) : 0,
+                // manage_stock off → keep current qty; never push 0 and wipe site stock
+                StockQuantity = trackStock
+                    ? Convert.ToInt32(Math.Round(wqty))
+                    : (currentStockQty ?? 0),
                 ManageStock = trackStock,
                 Status = (saleingprice <= 0) ? "draft" : "published"
             };
@@ -564,14 +568,17 @@ namespace BU50_API
             return wh;
         }
 
-        // Compare current site values with new values to skip unchanged updates
+        // Compare current site values with new values to skip unchanged updates.
+        // When manage_stock is off, only price/sale changes trigger an update (stock is ignored).
         private static bool ShouldIncludeUpdate(Products p, double newQty, double newRegularWithVat, decimal newSaleWithVat)
         {
             try
             {
-                // stock
-                var curQty = p.stock_quantity ?? 0;
-                if (Math.Abs(curQty - newQty) > 0.01) return true;
+                if (p.manage_stock)
+                {
+                    var curQty = p.stock_quantity ?? 0;
+                    if (Math.Abs(curQty - newQty) > 0.01) return true;
+                }
 
                 // prices are strings; parse if possible
                 double curReg = 0; double.TryParse(p.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out curReg);
@@ -747,7 +754,14 @@ namespace BU50_API
 
                             if (ShouldIncludeUpdate(product, pQty, regularWithVat, schemeRateWithVat))
                             {
-                                AddUpdateToBatch(product.id, trackStock ? pQty : 0, regularWithVat, schemeRateWithVat, product._custom_skn, trackStock);
+                                AddUpdateToBatch(
+                                    product.id,
+                                    trackStock ? pQty : 0,
+                                    regularWithVat,
+                                    schemeRateWithVat,
+                                    product._custom_skn,
+                                    trackStock,
+                                    product.stock_quantity);
                             }
 
                             // Flush batch every _batchSize products
@@ -1021,6 +1035,7 @@ namespace BU50_API
 
 
         // Synchronous version kept for fallback (when product ID is not numeric)
+        // When trackStock is false: update prices only; leave StockQuantity / ManageStock unchanged.
         public void UpdateProduct(string ProductId, double wqty, double _saleingprice, string SKN, bool trackStock = true, decimal schemeRateWithVat = -1)
         {
             var vat = 1.15;
@@ -1048,13 +1063,23 @@ namespace BU50_API
                         finalPrice = rateWithVat;
                     }
 
-                    var query = @"
+                    // manage_stock off → price-only UPDATE (do not touch stock columns)
+                    var query = trackStock
+                        ? @"
                         UPDATE Products
                         SET Price = @Price,
                             DiscountPrice = @DiscountPrice,
                             FinalPrice = @FinalPrice,
                             StockQuantity = @StockQuantity,
                             ManageStock = @ManageStock,
+                            Barcode = @Barcode,
+                            UpdatedAt = @UpdatedAt
+                        WHERE ProductId = @ProductId"
+                        : @"
+                        UPDATE Products
+                        SET Price = @Price,
+                            DiscountPrice = @DiscountPrice,
+                            FinalPrice = @FinalPrice,
                             Barcode = @Barcode,
                             UpdatedAt = @UpdatedAt
                         WHERE ProductId = @ProductId";
@@ -1065,8 +1090,11 @@ namespace BU50_API
                         cmd.Parameters.AddWithValue("@Price", saleingprice);
                         cmd.Parameters.AddWithValue("@DiscountPrice", rateWithVat > 0 ? (object)rateWithVat : DBNull.Value);
                         cmd.Parameters.AddWithValue("@FinalPrice", finalPrice);
-                        cmd.Parameters.AddWithValue("@StockQuantity", trackStock ? wqty : 0);
-                        cmd.Parameters.AddWithValue("@ManageStock", trackStock);
+                        if (trackStock)
+                        {
+                            cmd.Parameters.AddWithValue("@StockQuantity", wqty);
+                            cmd.Parameters.AddWithValue("@ManageStock", true);
+                        }
                         cmd.Parameters.AddWithValue("@Barcode", SKN ?? string.Empty);
                         cmd.Parameters.AddWithValue("@UpdatedAt", DateTime.UtcNow);
 
