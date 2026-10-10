@@ -820,7 +820,14 @@ ORDER BY SchemeBody.BodyId DESC";
                             if (saleingprice <= 0)
                             {
                                 zeroPriceProducts.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name}");
-                                // Keep going: still update stock / clear sale if needed; draft via Status when price<=0
+                                // Keep existing site price — never overwrite with 0 / force draft
+                                double keepPrice;
+                                if (double.TryParse(product.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out keepPrice) && keepPrice > 0)
+                                    saleingprice = keepPrice / 1.15; // stored later as * vat again
+                                else if (double.TryParse(product.price, NumberStyles.Any, CultureInfo.InvariantCulture, out keepPrice) && keepPrice > 0)
+                                    saleingprice = keepPrice / 1.15;
+                                else
+                                    continue; // nothing useful to sync
                             }
 
                             double pQty = 0; double avgVal = 0;
@@ -836,6 +843,11 @@ ORDER BY SchemeBody.BodyId DESC";
                                     Console.WriteLine($"Stock failed for {masterId}: {ex.Message}");
                                     pQty = product.stock_quantity ?? 0; // keep current qty on COM error
                                 }
+
+                                // Never push Focus zero-stock over site qty — price sync must not force out-of-stock
+                                var currentQty = product.stock_quantity ?? 0;
+                                if (pQty <= 0 && currentQty > 0)
+                                    pQty = currentQty;
                             }
 
                             // Prepare values for site and compare with current
