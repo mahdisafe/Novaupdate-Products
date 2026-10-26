@@ -6,6 +6,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -63,6 +64,28 @@ namespace BU50_API
         private static int ReadIntConfig(string key, int defaultValue)
         {
             return int.TryParse(ConfigurationManager.AppSettings[key], out var value) ? value : defaultValue;
+        }
+
+        // Brands that get price-only updates (App.config: PriceOnlyBrands)
+        private readonly Regex _priceOnlyBrandRegex = BuildBrandRegex(ConfigurationManager.AppSettings["PriceOnlyBrands"]);
+
+        private static Regex BuildBrandRegex(string csv)
+        {
+            var brands = (csv ?? string.Empty)
+                .Split(new[] { ',', ';' }, StringSplitOptions.RemoveEmptyEntries)
+                .Select(b => b.Trim())
+                .Where(b => b.Length > 0)
+                .Select(Regex.Escape)
+                .ToList();
+            return brands.Count == 0
+                ? null
+                : new Regex($@"\b({string.Join("|", brands)})\b", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+        }
+
+        private bool IsPriceOnlyBrand(string siteName, string focusName)
+        {
+            if (_priceOnlyBrandRegex == null) return false;
+            return _priceOnlyBrandRegex.IsMatch(siteName ?? string.Empty) || _priceOnlyBrandRegex.IsMatch(focusName ?? string.Empty);
         }
 
 
@@ -176,7 +199,9 @@ namespace BU50_API
  
         //Add a prepared update object to the batch (deduped by Woo product id within pending batch)
         // When trackStock is false: prices only — preserve existing stock fields (do not zero them).
-        private void AddUpdateToBatch(string productIdStr, double wqty, double saleingprice, decimal schemeRateWithVat, string skn, bool trackStock, int? currentStockQty = null)
+        // Status: no price -> draft; forcePublish -> published; otherwise keep the site's current status
+        // (products drafted manually on the site stay hidden).
+        private void AddUpdateToBatch(string productIdStr, double wqty, double saleingprice, decimal schemeRateWithVat, string skn, bool trackStock, int? currentStockQty = null, string currentStatus = null, bool forcePublish = false)
         {
             if (!int.TryParse(productIdStr, out var productId))
             {
@@ -195,7 +220,9 @@ namespace BU50_API
                     ? Convert.ToInt32(Math.Round(wqty))
                     : (currentStockQty ?? 0),
                 ManageStock = trackStock,
-                Status = (saleingprice <= 0) ? "draft" : "published"
+                Status = saleingprice <= 0 ? "draft"
+                    : forcePublish || string.IsNullOrWhiteSpace(currentStatus) ? "published"
+                    : currentStatus
             };
 
             var existingIdx = _pendingBatch.FindIndex(d => d.ProductId == productId);
@@ -423,6 +450,52 @@ namespace BU50_API
             public int MasterId { get; set; }
             public string Name { get; set; }
             public string BarcodeYH { get; set; }
+            public double SellPrice { get; set; }
+        }
+
+        // Row of TrakingOrdersDB.ProductSyncMapping: fixed site product -> Focus item link with per-product rules.
+        // MasterId NULL = never sync. SyncStock NULL = follow site manage_stock, 0 = price only, 1 = always sync stock.
+        private sealed class SyncMapping
+        {
+            public int? MasterId { get; set; }
+            public bool SyncPrice { get; set; }
+            public bool? SyncStock { get; set; }
+        }
+
+        private static Dictionary<int, SyncMapping> LoadSyncMappings(SqlConnection externalConnection)
+        {
+            var result = new Dictionary<int, SyncMapping>();
+            try
+            {
+                using (var cmd = new SqlCommand("SELECT ProductId, MasterId, SyncPrice, SyncStock FROM ProductSyncMapping", externalConnection))
+                using (var reader = cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        result[reader.GetInt32(0)] = new SyncMapping
+                        {
+                            MasterId = reader.IsDBNull(1) ? (int?)null : reader.GetInt32(1),
+                            SyncPrice = reader.GetBoolean(2),
+                            SyncStock = reader.IsDBNull(3) ? (bool?)null : reader.GetBoolean(3)
+                        };
+                    }
+                }
+            }
+            catch (SqlException ex)
+            {
+                Console.WriteLine("ProductSyncMapping not loaded: " + ex.Message);
+            }
+            return result;
+        }
+
+        private static readonly Regex FanSuffixRegex = new Regex(@"\s*FAN$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        // Split ACs exist in Focus as "<model> FAN" (priced) + "<model> COM" (price 0); key both the site SKU and
+        // the FAN barcode by the bare model so they match.
+        private static string BarcodeKey(string barcode)
+        {
+            var b = (barcode ?? string.Empty).Trim();
+            return FanSuffixRegex.Replace(b, string.Empty).Trim();
         }
 
         // Latest Focus sell price (srate c=1, pty=0, Vals0) — avoids per-item FRateMaster COM
@@ -602,6 +675,67 @@ ORDER BY SchemeBody.BodyId DESC";
             return result;
         }
 
+        // Focus mapping keyed by BarcodeKey (accepts "<sku> FAN" barcodes). When several Focus items share a key
+        // (e.g. AC FAN + COM units), the one with a sell price wins. Used for price-only brands.
+        private Dictionary<string, FocusProductInfo> LoadFocusProductInfoByModelMap(SqlConnection sql, IEnumerable<string> skus)
+        {
+            var result = new Dictionary<string, FocusProductInfo>(StringComparer.OrdinalIgnoreCase);
+            var values = (skus ?? Enumerable.Empty<string>())
+                .Select(BarcodeKey)
+                .Where(s => !string.IsNullOrWhiteSpace(s))
+                .SelectMany(s => new[] { s, s + " FAN", s + "FAN" })
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+            if (values.Count == 0) return result;
+
+            const int chunk = 600; // keep SQL params in safe range
+            for (int i = 0; i < values.Count; i += chunk)
+            {
+                var slice = values.Skip(i).Take(chunk).ToList();
+                var sb = new StringBuilder();
+                sb.Append(@"SELECT mr001.MasterId, mr001.Name, u0001.BarcodeYH, ISNULL(pr.Vals0, 0)
+FROM u0001 INNER JOIN mr001 ON u0001.ExtraId = mr001.MasterId
+OUTER APPLY (SELECT TOP 1 s.Vals0 FROM srate s WHERE s.prod = mr001.MasterId AND s.c = 1 AND s.pty = 0 ORDER BY s.Date_ DESC) pr
+WHERE u0001.BarcodeYH IN (");
+                for (int p = 0; p < slice.Count; p++)
+                {
+                    if (p > 0) sb.Append(',');
+                    sb.Append("@b").Append(p);
+                }
+                sb.Append(")");
+
+                using (var cmd = new SqlCommand(sb.ToString(), sql))
+                {
+                    for (int p = 0; p < slice.Count; p++)
+                    {
+                        cmd.Parameters.AddWithValue("@b" + p, slice[p]);
+                    }
+
+                    using (var reader = cmd.ExecuteReader())
+                    {
+                        while (reader.Read())
+                        {
+                            var barcode = reader.IsDBNull(2) ? string.Empty : reader.GetString(2);
+                            if (string.IsNullOrWhiteSpace(barcode)) continue;
+                            barcode = barcode.Trim();
+                            var candidate = new FocusProductInfo
+                            {
+                                MasterId = reader.GetInt32(0),
+                                Name = reader.IsDBNull(1) ? string.Empty : reader.GetString(1),
+                                BarcodeYH = barcode,
+                                SellPrice = Convert.ToDouble(reader.GetValue(3))
+                            };
+                            var key = BarcodeKey(barcode);
+                            if (!result.TryGetValue(key, out var existing) || (existing.SellPrice <= 0 && candidate.SellPrice > 0))
+                                result[key] = candidate;
+                        }
+                    }
+                }
+            }
+
+            return result;
+        }
+
         // Faster stock processor without DataRow dependency
         private List<string> ProcessStockFast(int masterId, string name, string barcodeYH, string productId, ref double pQty, ref double avgVal)
         {
@@ -635,6 +769,8 @@ ORDER BY SchemeBody.BodyId DESC";
                 double storePQty = 0;
                 double storeAvgVal = 0;
                 fr.GetStockOn(masterId, DateTime.Now.Date, rule.StoreId, ref storePQty, ref storeAvgVal);
+                // 19 COM calls per product run on the UI thread; pump messages so Windows doesn't kill the app as hung.
+                Application.DoEvents();
                 if (storePQty >= rule.MinBuffer)
                 {
                     var usable = Math.Max(0, storePQty - rule.MinBuffer);
@@ -651,11 +787,17 @@ ORDER BY SchemeBody.BodyId DESC";
 
         // Compare current site values with new values to skip unchanged updates.
         // When manage_stock is off, only price/sale changes trigger an update (stock is ignored).
-        private static bool ShouldIncludeUpdate(Products p, double newQty, double newRegularWithVat, decimal newSaleWithVat)
+        private static bool ShouldIncludeUpdate(Products p, bool trackStock, bool forcePublish, double newQty, double newRegularWithVat, decimal newSaleWithVat)
         {
             try
             {
-                if (p.manage_stock)
+                // manage_stock must be switched (price-only brands turn it off)
+                if (p.manage_stock != trackStock) return true;
+
+                if (forcePublish && newRegularWithVat > 0 && !string.Equals(p.status, "published", StringComparison.OrdinalIgnoreCase))
+                    return true;
+
+                if (trackStock)
                 {
                     var curQty = p.stock_quantity ?? 0;
                     if (Math.Abs(curQty - newQty) > 0.01) return true;
@@ -709,18 +851,22 @@ ORDER BY SchemeBody.BodyId DESC";
                         {
                             int x; return int.TryParse(p._custom_skn, out x) ? (int?)x : null;
                         }).Where(x => x.HasValue).Select(x => x.Value).Distinct().ToList();
-                        var focusMap = LoadFocusProductInfoMap(con, numericSkus);
-                        var emptySknSkus = products
-                            .Where(p => !int.TryParse(p._custom_skn, out _))
+                        var mappings = LoadSyncMappings(externalCon);
+                        var focusMap = LoadFocusProductInfoMap(con, numericSkus
+                            .Concat(mappings.Values.Where(m => m.MasterId.HasValue).Select(m => m.MasterId.Value)));
+
+                        // Price-only brands: model-based lookup, also used when the linked MasterId has no sell price (e.g. AC COM unit)
+                        var priceOnlySkus = products
+                            .Where(p => IsPriceOnlyBrand(p.Name, null))
                             .Select(p => p.sku)
                             .Where(s => !string.IsNullOrWhiteSpace(s))
                             .Distinct(StringComparer.OrdinalIgnoreCase)
                             .ToList();
-                        var focusByBarcodeMap = LoadFocusProductInfoByBarcodeMap(con, emptySknSkus);
+                        var focusByModelMap = LoadFocusProductInfoByModelMap(con, priceOnlySkus);
 
                         // Prefetch sell prices + active schemes (SQL) — major speedup vs per-item COM/SQL
                         var allMasterIds = focusMap.Keys
-                            .Concat(focusByBarcodeMap.Values.Select(v => v.MasterId))
+                            .Concat(focusByModelMap.Values.Select(v => v.MasterId))
                             .Distinct()
                             .ToList();
                         var priceMap = LoadFocusSellPriceMap(con, allMasterIds);
@@ -730,8 +876,9 @@ ORDER BY SchemeBody.BodyId DESC";
                         for (var i = 0; i < products.Count; i++)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
-                            // Keep the UI responsive so txtsku accepts keyboard input during long syncs.
-                            if (i % 10 == 0) await Task.Yield();
+                            // Yield every item: per-product Focus COM stock reads take ~2s on the UI thread,
+                            // and Windows kills the app as hung if messages aren't pumped for ~5s.
+                            await Task.Yield();
 
                             var product = products[i];
 
@@ -775,32 +922,55 @@ ORDER BY SchemeBody.BodyId DESC";
                                 lblcurrentRow.Update();
                             }
 
+                            SyncMapping mapping = null;
+                            if (int.TryParse(product.id, out var siteProductId))
+                                mappings.TryGetValue(siteProductId, out mapping);
+
                             FocusProductInfo info = null;
                             int masterId;
-                            if (int.TryParse(product._custom_skn, out masterId))
+                            if (mapping != null)
                             {
-                                if (!focusMap.TryGetValue(masterId, out info))
-                                    continue; // numeric _custom_skn but not found in Focus
+                                // Fixed mapping wins over SKU/barcode guessing
+                                if (mapping.MasterId.HasValue)
+                                    focusMap.TryGetValue(mapping.MasterId.Value, out info);
                             }
                             else
                             {
-                                // _custom_skn is empty/non-numeric on website: try resolving from current system SKU (BarcodeYH)
-                                var skuKey = (product.sku ?? string.Empty).Trim();
-                                if (string.IsNullOrWhiteSpace(skuKey) || !focusByBarcodeMap.TryGetValue(skuKey, out info))
+                                // Products without a numeric SKN on the website are left untouched
+                                if (!int.TryParse(product._custom_skn, out masterId))
                                     continue;
-                                masterId = info.MasterId;
+
+                                focusMap.TryGetValue(masterId, out info);
+
+                                // Price-only brands: linked item has no price -> resolve by model (prefers priced FAN unit)
+                                if (info != null && !priceMap.ContainsKey(info.MasterId)
+                                    && focusByModelMap.TryGetValue(BarcodeKey(product.sku), out var byModel)
+                                    && byModel.SellPrice > 0)
+                                {
+                                    info = byModel;
+                                }
                             }
+
+                            if (info == null)
+                                continue;
+                            masterId = info.MasterId;
+
+                            var priceOnly = mapping != null
+                                ? mapping.SyncStock == false
+                                : IsPriceOnlyBrand(product.Name, info.Name);
+                            var syncPrice = mapping?.SyncPrice ?? true;
 
                             // Update product info from Focus
                             product._custom_skn = info.MasterId.ToString();
                             product.Name = info.Name;
 
-                            // Respect Woo manage_stock early
-                            bool trackStock = product.manage_stock;
+                            bool trackStock = mapping != null
+                                ? (mapping.SyncStock ?? product.manage_stock)
+                                : (product.manage_stock && !priceOnly);
 
                             // Price: prefer prefetched SQL sell rate; COM fallback only if missing
                             double saleingprice = 0;
-                            if (!priceMap.TryGetValue(masterId, out saleingprice) || saleingprice <= 0)
+                            if (syncPrice && (!priceMap.TryGetValue(masterId, out saleingprice) || saleingprice <= 0))
                             {
                                 try
                                 {
@@ -819,7 +989,7 @@ ORDER BY SchemeBody.BodyId DESC";
 
                             if (saleingprice <= 0)
                             {
-                                zeroPriceProducts.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name}");
+                                if (syncPrice) zeroPriceProducts.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name}");
                                 // Keep existing site price — never overwrite with 0 / force draft
                                 double keepPrice;
                                 if (double.TryParse(product.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out keepPrice) && keepPrice > 0)
@@ -855,7 +1025,15 @@ ORDER BY SchemeBody.BodyId DESC";
                             var regularWithVat = saleingprice * vat;
 
                             Tuple<decimal, string> scheme;
-                            if (!schemeMap.TryGetValue(masterId, out scheme) || scheme == null)
+                            if (!syncPrice)
+                            {
+                                // SyncPrice off: keep the site's current sale price as-is
+                                double siteSale;
+                                scheme = double.TryParse(product.sale_price, NumberStyles.Any, CultureInfo.InvariantCulture, out siteSale) && siteSale > 0
+                                    ? Tuple.Create((decimal)(siteSale / vat), "Site")
+                                    : Tuple.Create(0m, "K/n");
+                            }
+                            else if (!schemeMap.TryGetValue(masterId, out scheme) || scheme == null)
                                 scheme = Tuple.Create(0m, "K/n");
 
                             var schemeRateWithVat = scheme.Item1 * (decimal)vat;
@@ -877,7 +1055,7 @@ ORDER BY SchemeBody.BodyId DESC";
                                 schemeRateWithVat > 0 ? schemeRateWithVat.ToString("F1", CultureInfo.InvariantCulture) : null,
                                 warehouseStr);
 
-                            if (ShouldIncludeUpdate(product, pQty, regularWithVat, schemeRateWithVat))
+                            if (ShouldIncludeUpdate(product, trackStock, priceOnly, pQty, regularWithVat, schemeRateWithVat))
                             {
                                 AddUpdateToBatch(
                                     product.id,
@@ -886,7 +1064,9 @@ ORDER BY SchemeBody.BodyId DESC";
                                     schemeRateWithVat,
                                     product._custom_skn,
                                     trackStock,
-                                    product.stock_quantity);
+                                    product.stock_quantity,
+                                    product.status,
+                                    priceOnly);
                             }
 
                             // Flush batch every _batchSize products
@@ -1346,6 +1526,13 @@ ORDER BY SchemeBody.BodyId DESC";
 
             if (_autoUpdateStarted) return;
             _autoUpdateStarted = true;
+
+            // Optional "--filter=<text>" launch argument: update only matching products (same as typing in txtsku);
+            // the app then stays open instead of exiting after the run.
+            var filterArg = Environment.GetCommandLineArgs()
+                .FirstOrDefault(a => a.StartsWith("--filter=", StringComparison.OrdinalIgnoreCase));
+            if (filterArg != null)
+                txtsku.Text = filterArg.Substring("--filter=".Length);
 
             // After the form is shown: fetch all products from WooCommerce, then run the update.
             BeginInvoke(new Action(() =>
