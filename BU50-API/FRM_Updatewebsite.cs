@@ -60,10 +60,143 @@ namespace BU50_API
         private readonly List<string> _batchFailureLog = new List<string>();
         private readonly int _batchSize = ReadIntConfig("BatchSize", 250);
         private readonly int _uiRefreshEvery = Math.Max(5, ReadIntConfig("UiRefreshEvery", 25));
+        private readonly double _maxPriceChangePercent = ReadDoubleConfig("MaxPriceChangePercent", 40);
+        private readonly bool _autoMode = HasLaunchFlag("--auto") || HasLaunchFlag("--silent");
+        private int _processExitCode;
 
         private static int ReadIntConfig(string key, int defaultValue)
         {
             return int.TryParse(ConfigurationManager.AppSettings[key], out var value) ? value : defaultValue;
+        }
+
+        private static double ReadDoubleConfig(string key, double defaultValue)
+        {
+            return double.TryParse(ConfigurationManager.AppSettings[key], NumberStyles.Any, CultureInfo.InvariantCulture, out var value)
+                ? value
+                : defaultValue;
+        }
+
+        private static bool HasLaunchFlag(string flag)
+        {
+            return Environment.GetCommandLineArgs()
+                .Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private sealed class SyncRunStats
+        {
+            public int Total;
+            public int Updated;
+            public int SkippedNoSkn;
+            public int SkippedExcluded;
+            public int SkippedUnlinked;
+            public int SkippedUnchanged;
+            public int SkippedSuspiciousPrice;
+            public int ZeroPrice;
+            public readonly List<string> SuspiciousPriceLines = new List<string>();
+            public readonly List<string> NoSknSamples = new List<string>();
+        }
+
+        private string ResolveSyncReportFolder()
+        {
+            var configured = (ConfigurationManager.AppSettings["SyncReportFolder"] ?? string.Empty).Trim();
+            if (!string.IsNullOrWhiteSpace(configured))
+                return configured;
+
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                "NovaShop",
+                "reports");
+        }
+
+        private void ShowError(string message)
+        {
+            if (_autoMode)
+            {
+                try
+                {
+                    var folder = ResolveSyncReportFolder();
+                    Directory.CreateDirectory(folder);
+                    File.AppendAllText(
+                        Path.Combine(folder, $"sync-errors-{DateTime.Now:yyyyMMdd}.log"),
+                        $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | {message}{Environment.NewLine}",
+                        Encoding.UTF8);
+                }
+                catch { }
+                Console.WriteLine(message);
+                return;
+            }
+
+            MessageBox.Show(message);
+        }
+
+        private bool IsSuspiciousPriceChange(Products product, double newRegularWithVat, out string reason)
+        {
+            reason = null;
+            if (_maxPriceChangePercent <= 0 || newRegularWithVat <= 0)
+                return false;
+
+            double current;
+            if (!double.TryParse(product.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out current) || current <= 0)
+                return false;
+
+            var changePercent = Math.Abs(newRegularWithVat - current) / current * 100.0;
+            if (changePercent <= _maxPriceChangePercent)
+                return false;
+
+            reason = $"site={current:F2} focus={newRegularWithVat:F2} change={changePercent:F1}% limit={_maxPriceChangePercent:F0}%";
+            return true;
+        }
+
+        private string WriteSyncReport(SyncRunStats stats, TimeSpan elapsed, bool debugSingle)
+        {
+            try
+            {
+                var folder = ResolveSyncReportFolder();
+                Directory.CreateDirectory(folder);
+                var path = Path.Combine(folder, $"sync-report-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+                var lines = new List<string>
+                {
+                    $"NovaShop product sync report - {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
+                    $"Mode: {(debugSingle ? "filter" : "full")}{(_autoMode ? " / auto" : string.Empty)}",
+                    $"Duration: {elapsed:mm\\:ss}",
+                    $"MaxPriceChangePercent: {_maxPriceChangePercent}",
+                    "------------------------------------------------------------",
+                    $"Total products loaded: {stats.Total}",
+                    $"Sent to site: {stats.Updated}",
+                    $"Skipped (no SKN): {stats.SkippedNoSkn}",
+                    $"Skipped (excluded category): {stats.SkippedExcluded}",
+                    $"Skipped (unlinked / not in Focus): {stats.SkippedUnlinked}",
+                    $"Skipped (unchanged): {stats.SkippedUnchanged}",
+                    $"Skipped (suspicious price change): {stats.SkippedSuspiciousPrice}",
+                    $"Zero Focus price: {stats.ZeroPrice}",
+                    $"Batch failures: {_batchFailureLog.Count}",
+                    "------------------------------------------------------------"
+                };
+
+                if (stats.SuspiciousPriceLines.Count > 0)
+                {
+                    lines.Add("Suspicious price changes (not sent):");
+                    lines.AddRange(stats.SuspiciousPriceLines);
+                    lines.Add("------------------------------------------------------------");
+                }
+
+                if (stats.NoSknSamples.Count > 0)
+                {
+                    lines.Add($"No-SKN samples (first {stats.NoSknSamples.Count}):");
+                    lines.AddRange(stats.NoSknSamples);
+                }
+
+                File.WriteAllLines(path, lines, Encoding.UTF8);
+
+                // Always keep a stable "latest" copy for Task Scheduler / monitoring.
+                File.Copy(path, Path.Combine(folder, "sync-report-latest.txt"), true);
+                return path;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Failed to write sync report: " + ex.Message);
+                return null;
+            }
         }
 
         // Brands that get price-only updates (App.config: PriceOnlyBrands)
@@ -829,6 +962,7 @@ WHERE u0001.BarcodeYH IN (");
             {
                 var zeroPriceProducts = new List<string>();
                 var schemeDiagnostics = new List<string>();
+                var stats = new SyncRunStats { Total = products.Count };
                 _batchFailureLog.Clear();
                 _updateSw.Restart();
                 lblProducts.Text = products.Count.ToString();
@@ -885,6 +1019,7 @@ WHERE u0001.BarcodeYH IN (");
                             // Skip excluded categories early to avoid costly COM/SQL calls
                             if (IsExcludedByCategory(product))
                             {
+                                stats.SkippedExcluded++;
                                 progressBar2.Value = Math.Min(progressBar2.Maximum, i + 1);
                                 continue;
                             }
@@ -938,7 +1073,12 @@ WHERE u0001.BarcodeYH IN (");
                             {
                                 // Products without a numeric SKN on the website are left untouched
                                 if (!int.TryParse(product._custom_skn, out masterId))
+                                {
+                                    stats.SkippedNoSkn++;
+                                    if (stats.NoSknSamples.Count < 50)
+                                        stats.NoSknSamples.Add($"{product.id}|{product.sku}|{product.status}");
                                     continue;
+                                }
 
                                 focusMap.TryGetValue(masterId, out info);
 
@@ -952,7 +1092,10 @@ WHERE u0001.BarcodeYH IN (");
                             }
 
                             if (info == null)
+                            {
+                                stats.SkippedUnlinked++;
                                 continue;
+                            }
                             masterId = info.MasterId;
 
                             var priceOnly = mapping != null
@@ -989,7 +1132,11 @@ WHERE u0001.BarcodeYH IN (");
 
                             if (saleingprice <= 0)
                             {
-                                if (syncPrice) zeroPriceProducts.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name}");
+                                if (syncPrice)
+                                {
+                                    stats.ZeroPrice++;
+                                    zeroPriceProducts.Add($"{DateTime.Now:yyyy-MM-dd HH:mm:ss} | sku={info.BarcodeYH} | masterId={masterId} | name={info.Name}");
+                                }
                                 // Keep existing site price — never overwrite with 0 / force draft
                                 double keepPrice;
                                 if (double.TryParse(product.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out keepPrice) && keepPrice > 0)
@@ -1055,7 +1202,16 @@ WHERE u0001.BarcodeYH IN (");
                                 schemeRateWithVat > 0 ? schemeRateWithVat.ToString("F1", CultureInfo.InvariantCulture) : null,
                                 warehouseStr);
 
-                            if (ShouldIncludeUpdate(product, trackStock, priceOnly, pQty, regularWithVat, schemeRateWithVat))
+                            if (!ShouldIncludeUpdate(product, trackStock, priceOnly, pQty, regularWithVat, schemeRateWithVat))
+                            {
+                                stats.SkippedUnchanged++;
+                            }
+                            else if (syncPrice && IsSuspiciousPriceChange(product, regularWithVat, out var priceReason))
+                            {
+                                stats.SkippedSuspiciousPrice++;
+                                stats.SuspiciousPriceLines.Add($"{product.id}|{product.sku}|{masterId}|{priceReason}");
+                            }
+                            else
                             {
                                 AddUpdateToBatch(
                                     product.id,
@@ -1067,6 +1223,7 @@ WHERE u0001.BarcodeYH IN (");
                                     product.stock_quantity,
                                     product.status,
                                     priceOnly);
+                                stats.Updated++;
                             }
 
                             // Flush batch every _batchSize products
@@ -1165,7 +1322,15 @@ WHERE u0001.BarcodeYH IN (");
                         }
                     }
 
-                    if (!debugSingle)
+                    _updateSw.Stop();
+                    var reportPath = WriteSyncReport(stats, _updateSw.Elapsed, debugSingle);
+                    lblStatus.Text = $"اكتمل التحديث في {_updateSw.Elapsed:mm\\:ss}.";
+                    if (!string.IsNullOrWhiteSpace(reportPath))
+                        Console.WriteLine("Sync report saved: " + reportPath);
+
+                    _processExitCode = _batchFailureLog.Count > 0 || stats.SkippedSuspiciousPrice > 0 ? 2 : 0;
+
+                    if (!debugSingle || _autoMode)
                     {
                         #region SendNoti
                         var hubConnection = new HubConnection("https://www.b50.app/");
@@ -1173,9 +1338,8 @@ WHERE u0001.BarcodeYH IN (");
                         try
                         {
                             await hubConnection.Start();
-                            await hubProxy.Invoke("SendNotification", $"Products Update has been done with Total {products.Count}");
-                            Application.ExitThread();
-                            Application.Exit();
+                            await hubProxy.Invoke("SendNotification",
+                                $"Products Update done. updated={stats.Updated}, noSkn={stats.SkippedNoSkn}, suspicious={stats.SkippedSuspiciousPrice}, total={products.Count}");
                         }
                         catch (Exception ex)
                         {
@@ -1186,15 +1350,35 @@ WHERE u0001.BarcodeYH IN (");
                             hubConnection.Stop();
                         }
                         #endregion
-                    }
 
+                        Environment.ExitCode = _processExitCode;
+                        Application.ExitThread();
+                        Application.Exit();
+                    }
+                }
+                else
+                {
                     _updateSw.Stop();
-                    lblStatus.Text = $"اكتمل التحديث في {_updateSw.Elapsed:mm\\:ss}.";
+                    WriteSyncReport(stats, _updateSw.Elapsed, debugSingle);
+                    lblStatus.Text = "لا توجد منتجات للتحديث.";
+                    if (_autoMode)
+                    {
+                        Environment.ExitCode = 0;
+                        Application.ExitThread();
+                        Application.Exit();
+                    }
                 }
             }
             catch (Exception ex)
             {
-                MessageBox.Show("An error occurred: " + ex.Message);
+                _processExitCode = 1;
+                Environment.ExitCode = 1;
+                ShowError("An error occurred: " + ex.Message);
+                if (_autoMode)
+                {
+                    Application.ExitThread();
+                    Application.Exit();
+                }
             }
         }
 
@@ -1527,12 +1711,22 @@ WHERE u0001.BarcodeYH IN (");
             if (_autoUpdateStarted) return;
             _autoUpdateStarted = true;
 
-            // Optional "--filter=<text>" launch argument: update only matching products (same as typing in txtsku);
-            // the app then stays open instead of exiting after the run.
+            // Optional "--filter=<text>" launch argument: update only matching products (same as typing in txtsku).
+            // With "--auto"/"--silent" the app always exits after the run (for Task Scheduler).
             var filterArg = Environment.GetCommandLineArgs()
                 .FirstOrDefault(a => a.StartsWith("--filter=", StringComparison.OrdinalIgnoreCase));
             if (filterArg != null)
                 txtsku.Text = filterArg.Substring("--filter=".Length);
+
+            if (_autoMode)
+            {
+                try
+                {
+                    WindowState = FormWindowState.Minimized;
+                    ShowInTaskbar = false;
+                }
+                catch { }
+            }
 
             // After the form is shown: fetch all products from WooCommerce, then run the update.
             BeginInvoke(new Action(() =>

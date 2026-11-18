@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Windows.Forms;
 
 namespace BU50_API
@@ -24,20 +25,23 @@ namespace BU50_API
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            var autoMode = Environment.GetCommandLineArgs()
+                .Any(a => string.Equals(a, "--auto", StringComparison.OrdinalIgnoreCase)
+                       || string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase));
+
             try
             {
                 Application.Run(new FRM_Updatewebsite());
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                // Optionally log the error here
-
-                // Close the current app
+                Environment.ExitCode = 1;
                 Application.ExitThread();
                 Application.Exit();
 
-                // Start a new instance
-                Process.Start(Application.ExecutablePath);
+                // Interactive runs may self-restart; scheduled/auto runs must not loop.
+                if (!autoMode)
+                    Process.Start(Application.ExecutablePath);
             }
         }
     }
