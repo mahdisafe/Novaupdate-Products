@@ -82,6 +82,20 @@ namespace BU50_API
                 .Any(a => string.Equals(a, flag, StringComparison.OrdinalIgnoreCase));
         }
 
+        private sealed class SyncReportRow
+        {
+            public string ProductId;
+            public string Sku;
+            public string MasterId;
+            public string Status;
+            public string SitePrice;
+            public string FocusPrice;
+            public string SalePrice;
+            public string Stock;
+            public string ChangePercent;
+            public string Note;
+        }
+
         private sealed class SyncRunStats
         {
             public int Total;
@@ -92,8 +106,9 @@ namespace BU50_API
             public int SkippedUnchanged;
             public int SkippedSuspiciousPrice;
             public int ZeroPrice;
-            public readonly List<string> SuspiciousPriceLines = new List<string>();
-            public readonly List<string> NoSknSamples = new List<string>();
+            public readonly List<SyncReportRow> UpdatedRows = new List<SyncReportRow>();
+            public readonly List<SyncReportRow> SuspiciousPriceRows = new List<SyncReportRow>();
+            public readonly List<SyncReportRow> NoSknRows = new List<SyncReportRow>();
         }
 
         private string ResolveSyncReportFolder()
@@ -129,22 +144,118 @@ namespace BU50_API
             MessageBox.Show(message);
         }
 
-        private bool IsSuspiciousPriceChange(Products product, double newRegularWithVat, out string reason)
+        private bool IsSuspiciousPriceChange(Products product, double newRegularWithVat, out double sitePrice, out double changePercent)
         {
-            reason = null;
+            sitePrice = 0;
+            changePercent = 0;
             if (_maxPriceChangePercent <= 0 || newRegularWithVat <= 0)
                 return false;
 
-            double current;
-            if (!double.TryParse(product.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out current) || current <= 0)
+            if (!double.TryParse(product.regular_price, NumberStyles.Any, CultureInfo.InvariantCulture, out sitePrice) || sitePrice <= 0)
                 return false;
 
-            var changePercent = Math.Abs(newRegularWithVat - current) / current * 100.0;
-            if (changePercent <= _maxPriceChangePercent)
-                return false;
+            changePercent = Math.Abs(newRegularWithVat - sitePrice) / sitePrice * 100.0;
+            return changePercent > _maxPriceChangePercent;
+        }
 
-            reason = $"site={current:F2} focus={newRegularWithVat:F2} change={changePercent:F1}% limit={_maxPriceChangePercent:F0}%";
-            return true;
+        private static string XmlEsc(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            return value
+                .Replace("&", "&amp;")
+                .Replace("<", "&lt;")
+                .Replace(">", "&gt;")
+                .Replace("\"", "&quot;");
+        }
+
+        private static void AppendExcelSheet(StringBuilder sb, string sheetName, string[] headers, IEnumerable<string[]> rows)
+        {
+            sb.AppendLine($" <Worksheet ss:Name=\"{XmlEsc(sheetName)}\">");
+            sb.AppendLine("  <Table>");
+            sb.Append("   <Row>");
+            foreach (var h in headers)
+                sb.Append($"<Cell ss:StyleID=\"Header\"><Data ss:Type=\"String\">{XmlEsc(h)}</Data></Cell>");
+            sb.AppendLine("</Row>");
+
+            foreach (var row in rows)
+            {
+                sb.Append("   <Row>");
+                for (var i = 0; i < headers.Length; i++)
+                {
+                    var cell = i < row.Length ? (row[i] ?? string.Empty) : string.Empty;
+                    if (Regex.IsMatch(cell, @"^-?\d+(\.\d+)?$"))
+                        sb.Append($"<Cell><Data ss:Type=\"Number\">{XmlEsc(cell)}</Data></Cell>");
+                    else
+                        sb.Append($"<Cell><Data ss:Type=\"String\">{XmlEsc(cell)}</Data></Cell>");
+                }
+                sb.AppendLine("</Row>");
+            }
+
+            sb.AppendLine("  </Table>");
+            sb.AppendLine(" </Worksheet>");
+        }
+
+        private string WriteSyncExcelReport(SyncRunStats stats, TimeSpan elapsed, bool debugSingle, string folder, string stamp)
+        {
+            var path = Path.Combine(folder, $"sync-report-{stamp}.xls");
+            var mode = $"{(debugSingle ? "filter" : "full")}{(_autoMode ? " / auto" : string.Empty)}";
+            var summaryRows = new[]
+            {
+                new[] { "وقت التقرير", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") },
+                new[] { "الوضع", mode },
+                new[] { "المدة", elapsed.ToString(@"mm\:ss") },
+                new[] { "حد تغير السعر %", _maxPriceChangePercent.ToString("0.##", CultureInfo.InvariantCulture) },
+                new[] { "إجمالي المنتجات", stats.Total.ToString(CultureInfo.InvariantCulture) },
+                new[] { "تم إرسالها للموقع", stats.Updated.ToString(CultureInfo.InvariantCulture) },
+                new[] { "بدون SKN", stats.SkippedNoSkn.ToString(CultureInfo.InvariantCulture) },
+                new[] { "فئة مستثناة", stats.SkippedExcluded.ToString(CultureInfo.InvariantCulture) },
+                new[] { "غير مربوط بـ Focus", stats.SkippedUnlinked.ToString(CultureInfo.InvariantCulture) },
+                new[] { "بدون تغيير", stats.SkippedUnchanged.ToString(CultureInfo.InvariantCulture) },
+                new[] { "سعر مشبوه (لم يُرسل)", stats.SkippedSuspiciousPrice.ToString(CultureInfo.InvariantCulture) },
+                new[] { "سعر Focus صفر", stats.ZeroPrice.ToString(CultureInfo.InvariantCulture) },
+                new[] { "أخطاء الدفعات", _batchFailureLog.Count.ToString(CultureInfo.InvariantCulture) }
+            };
+
+            var updated = stats.UpdatedRows.Select(r => new[]
+            {
+                r.ProductId, r.Sku, r.MasterId, r.SitePrice, r.FocusPrice, r.SalePrice, r.Stock, r.Status, r.Note
+            });
+            var suspicious = stats.SuspiciousPriceRows.Select(r => new[]
+            {
+                r.ProductId, r.Sku, r.MasterId, r.SitePrice, r.FocusPrice, r.ChangePercent, r.Status, r.Note
+            });
+            var noSkn = stats.NoSknRows.Select(r => new[]
+            {
+                r.ProductId, r.Sku, r.Status, r.Note
+            });
+            var failures = _batchFailureLog.Select(line => new[] { line });
+
+            var sb = new StringBuilder();
+            sb.AppendLine("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
+            sb.AppendLine("<?mso-application progid=\"Excel.Sheet\"?>");
+            sb.AppendLine("<Workbook xmlns=\"urn:schemas-microsoft-com:office:spreadsheet\"");
+            sb.AppendLine(" xmlns:ss=\"urn:schemas-microsoft-com:office:spreadsheet\">");
+            sb.AppendLine(" <Styles>");
+            sb.AppendLine("  <Style ss:ID=\"Header\"><Font ss:Bold=\"1\"/><Interior ss:Color=\"#D9E2F3\" ss:Pattern=\"Solid\"/></Style>");
+            sb.AppendLine(" </Styles>");
+
+            AppendExcelSheet(sb, "الملخص", new[] { "البند", "القيمة" }, summaryRows);
+            AppendExcelSheet(sb, "تم التحديث",
+                new[] { "رقم المنتج", "SKU", "SKN", "سعر الموقع السابق", "سعر Focus", "سعر العرض", "المخزون", "الحالة", "ملاحظة" },
+                updated);
+            AppendExcelSheet(sb, "أسعار مشبوهة",
+                new[] { "رقم المنتج", "SKU", "SKN", "سعر الموقع", "سعر Focus", "نسبة التغير %", "الحالة", "ملاحظة" },
+                suspicious);
+            AppendExcelSheet(sb, "بدون SKN",
+                new[] { "رقم المنتج", "SKU", "الحالة", "ملاحظة" },
+                noSkn);
+            if (_batchFailureLog.Count > 0)
+                AppendExcelSheet(sb, "أخطاء الدفعات", new[] { "التفاصيل" }, failures);
+
+            sb.AppendLine("</Workbook>");
+            File.WriteAllText(path, sb.ToString(), new UTF8Encoding(true));
+            File.Copy(path, Path.Combine(folder, "sync-report-latest.xls"), true);
+            return path;
         }
 
         private string WriteSyncReport(SyncRunStats stats, TimeSpan elapsed, bool debugSingle)
@@ -153,7 +264,8 @@ namespace BU50_API
             {
                 var folder = ResolveSyncReportFolder();
                 Directory.CreateDirectory(folder);
-                var path = Path.Combine(folder, $"sync-report-{DateTime.Now:yyyyMMdd-HHmmss}.txt");
+                var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                var path = Path.Combine(folder, $"sync-report-{stamp}.txt");
                 var lines = new List<string>
                 {
                     $"NovaShop product sync report - {DateTime.Now:yyyy-MM-dd HH:mm:ss}",
@@ -173,24 +285,26 @@ namespace BU50_API
                     "------------------------------------------------------------"
                 };
 
-                if (stats.SuspiciousPriceLines.Count > 0)
+                if (stats.SuspiciousPriceRows.Count > 0)
                 {
                     lines.Add("Suspicious price changes (not sent):");
-                    lines.AddRange(stats.SuspiciousPriceLines);
+                    lines.AddRange(stats.SuspiciousPriceRows.Select(r =>
+                        $"{r.ProductId}|{r.Sku}|{r.MasterId}|site={r.SitePrice}|focus={r.FocusPrice}|change={r.ChangePercent}%"));
                     lines.Add("------------------------------------------------------------");
                 }
 
-                if (stats.NoSknSamples.Count > 0)
+                if (stats.NoSknRows.Count > 0)
                 {
-                    lines.Add($"No-SKN samples (first {stats.NoSknSamples.Count}):");
-                    lines.AddRange(stats.NoSknSamples);
+                    lines.Add($"No-SKN samples (first {stats.NoSknRows.Count}):");
+                    lines.AddRange(stats.NoSknRows.Select(r => $"{r.ProductId}|{r.Sku}|{r.Status}"));
                 }
 
                 File.WriteAllLines(path, lines, Encoding.UTF8);
-
-                // Always keep a stable "latest" copy for Task Scheduler / monitoring.
                 File.Copy(path, Path.Combine(folder, "sync-report-latest.txt"), true);
-                return path;
+
+                var excelPath = WriteSyncExcelReport(stats, elapsed, debugSingle, folder, stamp);
+                Console.WriteLine("Excel sync report saved: " + excelPath);
+                return excelPath;
             }
             catch (Exception ex)
             {
@@ -1075,8 +1189,16 @@ WHERE u0001.BarcodeYH IN (");
                                 if (!int.TryParse(product._custom_skn, out masterId))
                                 {
                                     stats.SkippedNoSkn++;
-                                    if (stats.NoSknSamples.Count < 50)
-                                        stats.NoSknSamples.Add($"{product.id}|{product.sku}|{product.status}");
+                                    if (stats.NoSknRows.Count < 200)
+                                    {
+                                        stats.NoSknRows.Add(new SyncReportRow
+                                        {
+                                            ProductId = product.id,
+                                            Sku = product.sku,
+                                            Status = product.status,
+                                            Note = "لا يوجد SKN على الموقع"
+                                        });
+                                    }
                                     continue;
                                 }
 
@@ -1206,10 +1328,20 @@ WHERE u0001.BarcodeYH IN (");
                             {
                                 stats.SkippedUnchanged++;
                             }
-                            else if (syncPrice && IsSuspiciousPriceChange(product, regularWithVat, out var priceReason))
+                            else if (syncPrice && IsSuspiciousPriceChange(product, regularWithVat, out var sitePriceBefore, out var changePercent))
                             {
                                 stats.SkippedSuspiciousPrice++;
-                                stats.SuspiciousPriceLines.Add($"{product.id}|{product.sku}|{masterId}|{priceReason}");
+                                stats.SuspiciousPriceRows.Add(new SyncReportRow
+                                {
+                                    ProductId = product.id,
+                                    Sku = product.sku,
+                                    MasterId = masterId.ToString(CultureInfo.InvariantCulture),
+                                    SitePrice = sitePriceBefore.ToString("F2", CultureInfo.InvariantCulture),
+                                    FocusPrice = regularWithVat.ToString("F2", CultureInfo.InvariantCulture),
+                                    ChangePercent = changePercent.ToString("F1", CultureInfo.InvariantCulture),
+                                    Status = product.status,
+                                    Note = $"تجاوز حد {_maxPriceChangePercent:0.##}%"
+                                });
                             }
                             else
                             {
@@ -1224,6 +1356,22 @@ WHERE u0001.BarcodeYH IN (");
                                     product.status,
                                     priceOnly);
                                 stats.Updated++;
+                                stats.UpdatedRows.Add(new SyncReportRow
+                                {
+                                    ProductId = product.id,
+                                    Sku = product.sku,
+                                    MasterId = product._custom_skn,
+                                    SitePrice = product.regular_price,
+                                    FocusPrice = regularWithVat.ToString("F2", CultureInfo.InvariantCulture),
+                                    SalePrice = schemeRateWithVat > 0
+                                        ? schemeRateWithVat.ToString("F2", CultureInfo.InvariantCulture)
+                                        : string.Empty,
+                                    Stock = trackStock
+                                        ? pQty.ToString("0.##", CultureInfo.InvariantCulture)
+                                        : (product.stock_quantity ?? 0).ToString(CultureInfo.InvariantCulture),
+                                    Status = product.status,
+                                    Note = trackStock ? "سعر+مخزون" : "سعر فقط"
+                                });
                             }
 
                             // Flush batch every _batchSize products

@@ -52,9 +52,11 @@ while (-not $proc.HasExited) {
 
 $exitCode = $proc.ExitCode
 $latest = Join-Path $reportDir "sync-report-latest.txt"
+$latestExcel = Join-Path $reportDir "sync-report-latest.xls"
 Write-RunLog "ExitCode=$exitCode"
+if (Test-Path $latestExcel) { Write-RunLog "Latest Excel report: $latestExcel" }
 if (Test-Path $latest) {
-    Write-RunLog "Latest report: $latest"
+    Write-RunLog "Latest text report: $latest"
     Get-Content $latest -Encoding UTF8 | ForEach-Object { Write-RunLog $_ }
 }
 
